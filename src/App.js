@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import "./App.css";
 
 const OMDB = "https://www.omdbapi.com/?apikey=cf20b56c";
@@ -70,6 +70,11 @@ const chunkedDetails = async (titles, type, limit=48) => {
 
 const parseYear = y => Number(String(y || "").match(/\d{4}/)?.[0] || 0);
 const parseRuntime = r => Number(String(r || "").match(/\d+/)?.[0] || 0);
+const shortBlurb = plot => {
+  const clean = String(plot || "").trim();
+  if (!clean || clean === "N/A") return "A quick spoiler-free summary wasn't available, but it still matches the vibe you chose.";
+  return clean.length > 155 ? `${clean.slice(0,152).trimEnd()}…` : clean;
+};
 
 function scoreItem(item, a) {
   const genres = String(item.Genre || "").split(",").map(x => x.trim());
@@ -115,6 +120,30 @@ function App() {
   const [sort,setSort] = useState("match");
   const [saved,setSaved] = useState(() => new Set(JSON.parse(localStorage.getItem("tonightSaved") || "[]")));
   const [pick,setPick] = useState(null);
+  const [installPrompt,setInstallPrompt] = useState(null);
+  const [showInstallHelp,setShowInstallHelp] = useState(false);
+  const [isStandalone,setIsStandalone] = useState(false);
+
+  useEffect(() => {
+    const standalone = window.matchMedia?.("(display-mode: standalone)")?.matches || window.navigator.standalone === true;
+    setIsStandalone(Boolean(standalone));
+    const handlePrompt = event => {
+      event.preventDefault();
+      setInstallPrompt(event);
+    };
+    window.addEventListener("beforeinstallprompt",handlePrompt);
+    return () => window.removeEventListener("beforeinstallprompt",handlePrompt);
+  },[]);
+
+  const installApp = async () => {
+    if (installPrompt) {
+      installPrompt.prompt();
+      await installPrompt.userChoice;
+      setInstallPrompt(null);
+      return;
+    }
+    setShowInstallHelp(true);
+  };
 
   const q = QUESTIONS[step];
   const canContinue = q.multi ? answers.genres.length > 0 : Boolean(answers[q.key]);
@@ -149,7 +178,8 @@ function App() {
     const ranked = details.map(x => ({...x,...scoreItem(x,answers)})).sort((a,b)=>b.score-a.score);
     const max = ranked[0]?.score || 100, min = ranked[ranked.length-1]?.score || 0;
     const normalized = ranked.map(x => ({...x,match:Math.max(61,Math.min(98,Math.round(68 + ((x.score-min)/(Math.max(1,max-min)))*30))) })).slice(0,36);
-    setResults(normalized); setStatus(liveTitles.length ? `Live web search found ${liveTitles.length} candidate titles before matching.` : "Live search was unavailable, so the curated fallback was used.");
+    setResults(normalized);
+    setStatus(liveTitles.length ? `Live web search found ${liveTitles.length} candidate titles before matching.` : "Live search was unavailable, so the curated fallback was used.");
     setLoading(false);
   };
 
@@ -162,12 +192,28 @@ function App() {
   },[results,sort]);
 
   const toggleSave = (title) => {
-    const next = new Set(saved); next.has(title)?next.delete(title):next.add(title); setSaved(next); localStorage.setItem("tonightSaved",JSON.stringify([...next]));
+    const next = new Set(saved);
+    next.has(title)?next.delete(title):next.add(title);
+    setSaved(next);
+    localStorage.setItem("tonightSaved",JSON.stringify([...next]));
   };
 
-  const restart = () => { setStep(0); setResults([]); setPick(null); setAnswers({type:null,mood:null,genres:[],intensity:null,pace:null,era:null,company:null,runtime:null,familiarity:null,avoid:null}); };
+  const restart = () => {
+    setStep(0); setResults([]); setPick(null);
+    setAnswers({type:null,mood:null,genres:[],intensity:null,pace:null,era:null,company:null,runtime:null,familiarity:null,avoid:null});
+  };
 
-  if (loading) return <main className="page"><header className="top"><div className="brand"><span>▶</span> tonight.</div></header><section className="loadingCard"><div className="spinner"/><p className="kicker">SEARCHING THE WEB</p><h1>Building your watchlist…</h1><p>{status}</p></section></main>;
+  const installModal = showInstallHelp ? <div className="modal" onClick={()=>setShowInstallHelp(false)}>
+    <div className="modalCard" onClick={e=>e.stopPropagation()}>
+      <p className="kicker">ADD TONIGHT AS AN APP</p>
+      <h2>Put it on your Home Screen</h2>
+      <p>On iPhone: open this site in Safari, tap the <b>Share</b> button, choose <b>Add to Home Screen</b>, then tap <b>Add</b>. It will open like its own app.</p>
+      <div className="installSteps"><span>1. Safari</span><span>2. Share ⬆︎</span><span>3. Add to Home Screen</span></div>
+      <div className="modalButtons"><button className="primary" onClick={()=>setShowInstallHelp(false)}>Got it</button></div>
+    </div>
+  </div> : null;
+
+  if (loading) return <main className="page"><header className="top"><div className="brand"><span>▶</span> tonight.</div></header><section className="loadingCard"><div className="spinner"/><p className="kicker">SEARCHING THE WEB</p><h1>Building your watchlist…</h1><p>{status}</p></section>{installModal}</main>;
 
   if (results.length) return <main className="page">
     <header className="top"><div className="brand"><span>▶</span> tonight.</div><button className="ghost" onClick={restart}>Start over</button></header>
@@ -176,18 +222,29 @@ function App() {
     <p className="webStatus">🌐 {status}</p>
     <section className="grid">{displayed.map((item,i)=><article className="titleCard" key={item.imdbID}>
       <div className="poster">{item.Poster && item.Poster!=="N/A" ? <img src={item.Poster} alt={`${item.Title} poster`}/> : <div className="noPoster">{item.Title.slice(0,2).toUpperCase()}</div>}<div className="match">{item.match}%</div></div>
-      <div className="cardBody"><p className="rank">MATCH {String(i+1).padStart(2,"0")}</p><h2>{item.Title}</h2><p className="meta">{item.Year} • {item.Genre} • ⭐ {item.imdbRating}</p><p className="reason">{item.reason}</p><div className="cardActions"><button onClick={()=>toggleSave(item.Title)}>{saved.has(item.Title)?"♥ Saved":"♡ Save"}</button><a href={`https://www.google.com/search?q=${encodeURIComponent("where to watch "+item.Title+" South Africa")}`} target="_blank" rel="noreferrer">Where to watch ↗</a></div></div>
+      <div className="cardBody">
+        <p className="rank">MATCH {String(i+1).padStart(2,"0")}</p>
+        <h2>{item.Title}</h2>
+        <p className="meta">{item.Year} • {item.Genre} • ⭐ {item.imdbRating}</p>
+        <p className="blurb">{shortBlurb(item.Plot)}</p>
+        <p className="reason"><b>Why it fits:</b> {item.reason}</p>
+        <div className="cardActions"><button onClick={()=>toggleSave(item.Title)}>{saved.has(item.Title)?"♥ Saved":"♡ Save"}</button><a href={`https://www.google.com/search?q=${encodeURIComponent("where to watch "+item.Title+" South Africa")}`} target="_blank" rel="noreferrer">Where to watch ↗</a></div>
+      </div>
     </article>)}</section>
     <section className="picker"><div><p className="kicker">STILL STUCK?</p><h2>Stop scrolling. Let me choose.</h2></div><button className="primary" onClick={()=>setPick(displayed[Math.floor(Math.random()*Math.min(10,displayed.length))])}>Pick one for me ✨</button></section>
     {pick && <div className="modal" onClick={()=>setPick(null)}><div className="modalCard" onClick={e=>e.stopPropagation()}><p className="kicker">TONIGHT'S PICK</p><h2>{pick.Title}</h2><p>{pick.Plot}</p><p className="meta">{pick.Year} • {pick.Genre} • ⭐ {pick.imdbRating}</p><div className="modalButtons"><button className="ghost" onClick={()=>setPick(displayed[Math.floor(Math.random()*Math.min(10,displayed.length))])}>Pick another</button><button className="primary" onClick={()=>setPick(null)}>That’s the one 🍿</button></div></div></div>}
+    {installModal}
   </main>;
 
-  return <main className="page"><header className="top"><div className="brand"><span>▶</span> tonight.</div><div className="pill">live discovery</div></header>
+  return <main className="page">
+    <header className="top"><div className="brand"><span>▶</span> tonight.</div><div className="topActions"><div className="pill">live discovery</div>{!isStandalone && <button className="installButton" onClick={installApp}>＋ Add as app</button>}</div></header>
     <section className="hero"><p className="kicker">NO MORE ENDLESS SCROLLING</p><h1>What should we watch?</h1><p>Answer ten quick questions. Then I’ll search the web, check real movie data and build at least 30 matches around your mood.</p></section>
+    {!isStandalone && <section className="installCard"><div><strong>Want Tonight on your Home Screen?</strong><p>Install it once and open it like a normal app whenever you need a movie or series.</p></div><button className="ghost" onClick={installApp}>Add to Home Screen</button></section>}
     <section className="quizCard"><div className="progress"><div style={{width:`${((step+1)/QUESTIONS.length)*100}%`}}/></div><div className="counter">{step+1} / {QUESTIONS.length}</div><p className="kicker">QUESTION {step+1}</p><h2>{q.title}</h2><p className="sub">{q.sub}</p>
       {q.multi ? <div className="genreGrid">{GENRES.map(g=><button key={g} className={answers.genres.includes(g)?"choice selected":"choice"} onClick={()=>select(g)}>{g}</button>)}</div> : <div className="choices">{q.options.map(([value,emoji,label,small])=><button key={value} className={answers[q.key]===value?"choice selected":"choice"} onClick={()=>select(value)}><span>{emoji}</span><div><strong>{label}</strong><small>{small}</small></div></button>)}</div>}
       <div className="nav"><button className="ghost" disabled={step===0} onClick={()=>setStep(s=>Math.max(0,s-1))}>← Back</button><button className="primary" disabled={!canContinue} onClick={()=>step===QUESTIONS.length-1?search():setStep(s=>s+1)}>{step===QUESTIONS.length-1?"Find my picks ✨":"Continue →"}</button></div>
     </section>
+    {installModal}
   </main>;
 }
 

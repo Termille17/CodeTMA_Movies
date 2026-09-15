@@ -18,7 +18,7 @@ jobs:
         with:
           channel: stable
           cache: true
-      - name: Create Windows app
+      - name: Create Windows app and installer
         shell: pwsh
         run: |
           flutter config --enable-windows-desktop
@@ -29,10 +29,63 @@ jobs:
           flutter pub get
           $env:CL="/D_SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS"
           flutter build windows --release
+
+          $release = (Resolve-Path 'build\windows\x64\runner\Release').Path
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vsPath) { throw 'Visual Studio C++ toolchain not found' }
+          $crt = Get-ChildItem "$vsPath\VC\Redist\MSVC" -Recurse -Filter msvcp140.dll |
+            Where-Object { $_.FullName -match '\\x64\\Microsoft\.VC.*\.CRT\\' } |
+            Select-Object -First 1
+          if (-not $crt) { throw 'x64 Visual C++ redistributable runtime not found' }
+          $crtDir = $crt.Directory.FullName
+          Copy-Item "$crtDir\*.dll" $release -Force
+          Write-Host "Bundled VC++ runtime from $crtDir"
+
+          choco install innosetup -y --no-progress
+          New-Item -ItemType Directory -Force installer | Out-Null
+          $iss = @"
+          [Setup]
+          AppId={{8C8DD3E5-9582-4CD0-A83D-B998E31A61DA}
+          AppName=Vista TV
+          AppVersion=0.1.0
+          AppPublisher=Vista TV
+          DefaultDirName={localappdata}\Programs\Vista TV
+          DefaultGroupName=Vista TV
+          UninstallDisplayIcon={app}\vista_tv.exe
+          OutputDir=installer
+          OutputBaseFilename=Vista-TV-Setup
+          Compression=lzma2
+          SolidCompression=yes
+          ArchitecturesAllowed=x64compatible
+          ArchitecturesInstallIn64BitMode=x64compatible
+          PrivilegesRequired=lowest
+          WizardStyle=modern
+          DisableProgramGroupPage=yes
+
+          [Files]
+          Source: "$release\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+
+          [Icons]
+          Name: "{autoprograms}\Vista TV"; Filename: "{app}\vista_tv.exe"
+          Name: "{autodesktop}\Vista TV"; Filename: "{app}\vista_tv.exe"
+
+          [Run]
+          Filename: "{app}\vista_tv.exe"; Description: "Open Vista TV"; Flags: nowait postinstall skipifsilent
+          "@
+          Set-Content -Path installer\vista.iss -Value $iss -Encoding UTF8
+          $iscc = @(
+            'C:\Program Files (x86)\Inno Setup 6\ISCC.exe',
+            'C:\Program Files\Inno Setup 6\ISCC.exe'
+          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $iscc) { throw 'Inno Setup compiler not found' }
+          & $iscc installer\vista.iss
+          if (-not (Test-Path installer\Vista-TV-Setup.exe)) { throw 'Installer was not created' }
+
       - uses: actions/upload-artifact@v4
         with:
-          name: Vista-TV-Windows
-          path: vista_build/build/windows/x64/runner/Release/**
+          name: Vista-TV-Windows-Installer
+          path: vista_build/installer/Vista-TV-Setup.exe
           if-no-files-found: error
 
   android:

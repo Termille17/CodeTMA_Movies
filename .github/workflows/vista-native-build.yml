@@ -18,7 +18,7 @@ jobs:
         with:
           channel: stable
           cache: true
-      - name: Create Windows app and installer
+      - name: Create Windows app, portable bundle and installer
         shell: pwsh
         run: |
           flutter config --enable-windows-desktop
@@ -26,8 +26,7 @@ jobs:
           Copy-Item vista-native\main.dart vista_build\lib\main.dart -Force
           Copy-Item vista-native\pubspec.yaml vista_build\pubspec.yaml -Force
 
-          # Add an early native startup trace. If the process reaches wWinMain we will
-          # always have a log under %LOCALAPPDATA%\Vista TV\startup.log.
+          # Early native startup trace under %LOCALAPPDATA%\Vista TV\startup.log.
           $mainCpp = 'vista_build\windows\runner\main.cpp'
           $cpp = Get-Content $mainCpp -Raw
           $cpp = $cpp -replace '#include <windows.h>', @'
@@ -54,7 +53,7 @@ jobs:
               std::wofstream log(logPath, std::ios::app);
               log << L"Flutter window creation failed\n";
             }
-            MessageBoxW(nullptr, L"Vista TV could not create its window. Please send the file %LOCALAPPDATA%\\Vista TV\\startup.log.", L"Vista TV startup error", MB_OK | MB_ICONERROR);
+            MessageBoxW(nullptr, L"Vista TV could not create its window. Please send %LOCALAPPDATA%\\Vista TV\\startup.log.", L"Vista TV startup error", MB_OK | MB_ICONERROR);
             return EXIT_FAILURE;
           }
           if (!logPath.empty()) {
@@ -74,7 +73,7 @@ jobs:
           $vsPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
           if (-not $vsPath) { throw 'Visual Studio C++ toolchain not found' }
 
-          # Pick the newest full x64 CRT, explicitly excluding old OneCore redistributables.
+          # Bundle newest full x64 VC runtime from the active compiler, excluding OneCore.
           $crtCandidates = Get-ChildItem "$vsPath\VC\Redist\MSVC" -Recurse -Filter msvcp140.dll |
             Where-Object { $_.FullName -match '\\x64\\Microsoft\.VC.*\.CRT\\' -and $_.FullName -notmatch '\\onecore\\' }
           if (-not $crtCandidates) { throw 'Full x64 Visual C++ runtime not found' }
@@ -85,7 +84,18 @@ jobs:
           Copy-Item "$crtDir\*.dll" $release -Force
           Write-Host "Bundled matching VC++ runtime from $crtDir"
 
-          # Also ship the official redistributable from the active compiler toolchain.
+          # Give the application a clean executable name so stale vista_tv.exe shortcuts cannot target it.
+          if (Test-Path "$release\vista_tv.exe") {
+            Rename-Item "$release\vista_tv.exe" 'VistaTV.exe' -Force
+          }
+          if (-not (Test-Path "$release\VistaTV.exe")) { throw 'VistaTV.exe missing after rename' }
+
+          # Build a portable folder from the exact same verified release binaries.
+          $portable = (New-Item -ItemType Directory -Force 'portable').FullName
+          Copy-Item "$release\*" $portable -Recurse -Force
+          Set-Content -Path "$portable\START-VISTA-TV.txt" -Encoding UTF8 -Value "Double-click VistaTV.exe. Keep all DLLs and the data folder beside it."
+
+          # Official redistributable is also installed by Setup as a safety net.
           $vcRedist = Get-ChildItem "$vsPath\VC\Redist\MSVC" -Recurse -Filter VC_redist.x64.exe |
             Where-Object { $_.FullName -notmatch '\\onecore\\' } |
             Sort-Object FullName -Descending |
@@ -98,15 +108,15 @@ jobs:
 
           $iss = @"
           [Setup]
-          AppId={{8C8DD3E5-9582-4CD0-A83D-B998E31A61DA}
+          AppId={{A53D1E41-EB50-48E2-961B-D9FF5D42B4A2}
           AppName=Vista TV
-          AppVersion=0.1.1
+          AppVersion=0.1.2
           AppPublisher=Vista TV
-          DefaultDirName={localappdata}\Programs\Vista TV
+          DefaultDirName={localappdata}\Programs\VistaTV
           DefaultGroupName=Vista TV
-          UninstallDisplayIcon={app}\vista_tv.exe
+          UninstallDisplayIcon={app}\VistaTV.exe
           OutputDir=.
-          OutputBaseFilename=Vista-TV-Setup
+          OutputBaseFilename=Vista-TV-Setup-0.1.2
           Compression=lzma2
           SolidCompression=yes
           ArchitecturesAllowed=x64compatible
@@ -114,18 +124,24 @@ jobs:
           PrivilegesRequired=lowest
           WizardStyle=modern
           DisableProgramGroupPage=yes
+          UsePreviousAppDir=no
+
+          [InstallDelete]
+          Type: files; Name: "{userdesktop}\Vista TV.lnk"
+          Type: files; Name: "{userprograms}\Vista TV.lnk"
+          Type: filesandordirs; Name: "{localappdata}\Programs\VistaTV"
 
           [Files]
           Source: "$release\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
           Source: "VC_redist.x64.exe"; DestDir: "{tmp}"; Flags: deleteafterinstall
 
           [Icons]
-          Name: "{autoprograms}\Vista TV"; Filename: "{app}\vista_tv.exe"
-          Name: "{autodesktop}\Vista TV"; Filename: "{app}\vista_tv.exe"
+          Name: "{userprograms}\Vista TV"; Filename: "{app}\VistaTV.exe"; WorkingDir: "{app}"
+          Name: "{userdesktop}\Vista TV"; Filename: "{app}\VistaTV.exe"; WorkingDir: "{app}"
 
           [Run]
           Filename: "{tmp}\VC_redist.x64.exe"; Parameters: "/install /quiet /norestart"; StatusMsg: "Installing Microsoft Visual C++ runtime..."; Flags: waituntilterminated
-          Filename: "{app}\vista_tv.exe"; Description: "Open Vista TV"; Flags: nowait postinstall skipifsilent
+          Filename: "{app}\VistaTV.exe"; Description: "Open Vista TV"; WorkingDir: "{app}"; Flags: nowait postinstall skipifsilent
           "@
           Set-Content -Path installer\vista.iss -Value $iss -Encoding UTF8
           $iscc = @(
@@ -134,12 +150,17 @@ jobs:
           ) | Where-Object { Test-Path $_ } | Select-Object -First 1
           if (-not $iscc) { throw 'Inno Setup compiler not found' }
           & $iscc installer\vista.iss
-          if (-not (Test-Path installer\Vista-TV-Setup.exe)) { throw 'Installer was not created' }
+          if (-not (Test-Path installer\Vista-TV-Setup-0.1.2.exe)) { throw 'Installer was not created' }
 
       - uses: actions/upload-artifact@v4
         with:
           name: Vista-TV-Windows-Installer
-          path: vista_build/installer/Vista-TV-Setup.exe
+          path: vista_build/installer/Vista-TV-Setup-0.1.2.exe
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Vista-TV-Windows-Portable
+          path: vista_build/portable/**
           if-no-files-found: error
 
   android:

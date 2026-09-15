@@ -27,6 +27,7 @@ jobs:
           Copy-Item vista-native\pubspec.yaml vista_build\pubspec.yaml -Force
           Set-Location vista_build
           flutter pub get
+          $env:CL="/D_SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS"
           flutter build windows --release
       - uses: actions/upload-artifact@v4
         with:

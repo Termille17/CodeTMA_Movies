@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:collection';
 import 'dart:io';
 
@@ -113,6 +114,9 @@ class VistaShell extends StatefulWidget {
 class _VistaShellState extends State<VistaShell> {
   double progress = 0;
   InAppWebViewController? webController;
+  Timer? retryTimer;
+  int retryCount = 0;
+  bool initialLoadStarted = false;
 
   Future<void> openPlayer(dynamic value) async {
     if (value is! Map) return;
@@ -123,7 +127,34 @@ class _VistaShellState extends State<VistaShell> {
   }
 
   Future<void> loadVistaRoot() async {
+    if (!mounted) return;
     await webController?.loadUrl(urlRequest: URLRequest(url: WebUri(vistaOrigin)));
+  }
+
+  void scheduleVistaRetry() {
+    if (!mounted || retryCount >= 6) return;
+    retryTimer?.cancel();
+    final delayMs = 700 + (retryCount * 650);
+    retryCount += 1;
+    retryTimer = Timer(Duration(milliseconds: delayMs), () async {
+      if (!mounted) return;
+      await loadVistaRoot();
+    });
+  }
+
+  bool isTransientNetworkError(WebResourceError error) {
+    final description = error.description.toLowerCase();
+    return description.contains('err_network_changed') ||
+        description.contains('network changed') ||
+        description.contains('internet disconnected') ||
+        description.contains('connection reset') ||
+        description.contains('connection aborted');
+  }
+
+  @override
+  void dispose() {
+    retryTimer?.cancel();
+    super.dispose();
   }
 
   @override
@@ -133,7 +164,7 @@ class _VistaShellState extends State<VistaShell> {
         top: Platform.isWindows,
         bottom: false,
         child: InAppWebView(
-          initialUrlRequest: URLRequest(url: WebUri(vistaOrigin)),
+          initialUrlRequest: null,
           initialUserScripts: UnmodifiableListView<UserScript>([
             UserScript(source: nativeBridge, injectionTime: UserScriptInjectionTime.AT_DOCUMENT_START, forMainFrameOnly: true),
           ]),
@@ -153,8 +184,20 @@ class _VistaShellState extends State<VistaShell> {
                 return {'ok': true};
               },
             );
+
+            if (!initialLoadStarted) {
+              initialLoadStarted = true;
+              Future.delayed(const Duration(milliseconds: 1200), () async {
+                if (mounted) await loadVistaRoot();
+              });
+            }
+          },
+          onLoadStart: (_, __) {
+            retryTimer?.cancel();
           },
           onLoadStop: (controller, url) async {
+            retryTimer?.cancel();
+            retryCount = 0;
             final uri = Uri.tryParse(url?.toString() ?? '');
             if (uri != null && uri.host == 'vista-tv.vercel.app' && uri.path == '/login') {
               await loadVistaRoot();
@@ -162,7 +205,15 @@ class _VistaShellState extends State<VistaShell> {
             }
             await controller.evaluateJavascript(source: nativeBridge);
           },
-          onProgressChanged: (_, p) { if (mounted) setState(() => progress = p / 100); },
+          onReceivedError: (_, request, error) {
+            final isMainFrame = request.isForMainFrame == true;
+            if (isMainFrame && isTransientNetworkError(error)) {
+              scheduleVistaRetry();
+            }
+          },
+          onProgressChanged: (_, p) {
+            if (mounted) setState(() => progress = p / 100);
+          },
           shouldOverrideUrlLoading: (_, action) async {
             final raw = action.request.url?.toString();
             if (raw == null) return NavigationActionPolicy.CANCEL;
@@ -172,13 +223,16 @@ class _VistaShellState extends State<VistaShell> {
               await loadVistaRoot();
               return NavigationActionPolicy.CANCEL;
             }
-            // A native Vista build must never navigate the WebView into a stream URL.
             if (uri.path.startsWith('/api/play/')) return NavigationActionPolicy.CANCEL;
             return NavigationActionPolicy.ALLOW;
           },
         ),
       ),
-      if (progress < 1) Align(alignment: Alignment.topCenter, child: LinearProgressIndicator(value: progress == 0 ? null : progress, minHeight: 1)),
+      if (progress < 1)
+        Align(
+          alignment: Alignment.topCenter,
+          child: LinearProgressIndicator(value: progress == 0 ? null : progress, minHeight: 1),
+        ),
     ]),
   );
 }
@@ -222,8 +276,29 @@ class _VistaPlayerState extends State<VistaPlayer> {
     backgroundColor: Colors.black,
     body: Stack(children: [
       Positioned.fill(child: Video(controller: controller, controls: AdaptiveVideoControls, fit: BoxFit.contain)),
-      Positioned(top: 18, left: 18, child: SafeArea(child: IconButton.filledTonal(onPressed: () => Navigator.of(context).maybePop(), icon: const Icon(Icons.arrow_back_rounded)))),
-      Positioned(top: 24, left: 76, right: 76, child: SafeArea(child: Text(widget.title, maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600)))),
+      Positioned(
+        top: 18,
+        left: 18,
+        child: SafeArea(
+          child: IconButton.filledTonal(
+            onPressed: () => Navigator.of(context).maybePop(),
+            icon: const Icon(Icons.arrow_back_rounded),
+          ),
+        ),
+      ),
+      Positioned(
+        top: 24,
+        left: 76,
+        right: 76,
+        child: SafeArea(
+          child: Text(
+            widget.title,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
+          ),
+        ),
+      ),
     ]),
   );
 }

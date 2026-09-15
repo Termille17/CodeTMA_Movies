@@ -35,6 +35,15 @@ jobs:
           p.write_text(s)
           PY
           flutter pub get
+          python3 - <<'PY'
+          from pathlib import Path
+          root=Path.home()/'.pub-cache/hosted/pub.dev'
+          for p in root.glob('flutter_inappwebview_android-*/android/build.gradle'):
+              s=p.read_text()
+              s=s.replace("getDefaultProguardFile('proguard-android.txt')", "getDefaultProguardFile('proguard-android-optimize.txt')")
+              p.write_text(s)
+              print('Patched', p)
+          PY
           flutter build apk --release
       - name: Upload Android APK
         uses: actions/upload-artifact@v4

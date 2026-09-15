@@ -1,0 +1,65 @@
+name: Build Vista Native
+
+on:
+  push:
+    branches: [vista-tv-deploy]
+    paths:
+      - 'vista-native/**'
+      - '.github/workflows/vista-native-build.yml'
+  workflow_dispatch:
+
+jobs:
+  windows:
+    name: Windows Vista TV
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - name: Create Windows app
+        shell: pwsh
+        run: |
+          flutter config --enable-windows-desktop
+          flutter create --platforms=windows --project-name vista_tv --org com.vistatv vista_build
+          Copy-Item vista-native\main.dart vista_build\lib\main.dart -Force
+          Copy-Item vista-native\pubspec.yaml vista_build\pubspec.yaml -Force
+          Set-Location vista_build
+          flutter pub get
+          flutter build windows --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Vista-TV-Windows
+          path: vista_build/build/windows/x64/runner/Release/**
+          if-no-files-found: error
+
+  android:
+    name: Android Vista TV
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - name: Create Android app
+        run: |
+          flutter create --platforms=android --project-name vista_tv --org com.vistatv vista_build
+          cp vista-native/main.dart vista_build/lib/main.dart
+          cp vista-native/pubspec.yaml vista_build/pubspec.yaml
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('vista_build/android/app/src/main/AndroidManifest.xml')
+          s=p.read_text()
+          s=s.replace('<application', '<application android:usesCleartextTraffic="true"', 1)
+          p.write_text(s)
+          PY
+          cd vista_build
+          flutter pub get
+          flutter build apk --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Vista-TV-Android
+          path: vista_build/build/app/outputs/flutter-apk/app-release.apk
+          if-no-files-found: error

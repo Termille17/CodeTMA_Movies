@@ -57,6 +57,19 @@ jobs:
           PY
           cd vista_build
           flutter pub get
+          python3 - <<'PY'
+          from pathlib import Path
+          roots=list(Path.home().glob('.pub-cache/hosted/pub.dev/flutter_inappwebview_android-*/android/build.gradle'))
+          if not roots:
+              raise SystemExit('flutter_inappwebview_android build.gradle not found')
+          for p in roots:
+              s=p.read_text()
+              old="getDefaultProguardFile('proguard-android.txt')"
+              new="getDefaultProguardFile('proguard-android-optimize.txt')"
+              if old in s:
+                  p.write_text(s.replace(old,new))
+                  print('Patched', p)
+          PY
           flutter build apk --release
       - uses: actions/upload-artifact@v4
         with:

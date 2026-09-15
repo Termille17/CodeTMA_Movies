@@ -1,0 +1,108 @@
+name: Vista Native Builds
+
+on:
+  push:
+    branches: [vista-tv-deploy]
+    paths:
+      - 'vista-native/**'
+      - '.github/workflows/vista-native.yml'
+  workflow_dispatch:
+
+jobs:
+  android:
+    name: Android APK
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - name: Create Vista Android project
+        shell: bash
+        run: |
+          rm -rf build/vista_android
+          mkdir -p build/vista_android
+          cd build/vista_android
+          flutter create --platforms=android --project-name vista_tv --org com.vistatv .
+          cp ../../vista-native/pubspec.yaml pubspec.yaml
+          cp ../../vista-native/main.dart lib/main.dart
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('android/app/src/main/AndroidManifest.xml')
+          s=p.read_text()
+          s=s.replace('<application', '<application android:usesCleartextTraffic="true"', 1)
+          p.write_text(s)
+          PY
+          flutter pub get
+          flutter build apk --release
+      - name: Upload Android APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Vista-TV-Android
+          path: build/vista_android/build/app/outputs/flutter-apk/app-release.apk
+          if-no-files-found: error
+
+  windows:
+    name: Windows App
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - name: Create Vista Windows project
+        shell: pwsh
+        run: |
+          if (Test-Path build/vista_windows) { Remove-Item build/vista_windows -Recurse -Force }
+          New-Item -ItemType Directory -Force build/vista_windows | Out-Null
+          Set-Location build/vista_windows
+          flutter config --enable-windows-desktop
+          flutter create --platforms=windows --project-name vista_tv --org com.vistatv .
+          Copy-Item ../../vista-native/pubspec.yaml ./pubspec.yaml -Force
+          Copy-Item ../../vista-native/main.dart ./lib/main.dart -Force
+          flutter pub get
+          flutter build windows --release
+          Compress-Archive -Path build/windows/x64/runner/Release/* -DestinationPath Vista-TV-Windows.zip -Force
+      - name: Upload Windows app
+        uses: actions/upload-artifact@v4
+        with:
+          name: Vista-TV-Windows
+          path: build/vista_windows/Vista-TV-Windows.zip
+          if-no-files-found: error
+
+  ios-check:
+    name: iPhone unsigned build check
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - name: Create Vista iOS project
+        shell: bash
+        run: |
+          rm -rf build/vista_ios
+          mkdir -p build/vista_ios
+          cd build/vista_ios
+          flutter create --platforms=ios --project-name vista_tv --org com.vistatv .
+          cp ../../vista-native/pubspec.yaml pubspec.yaml
+          cp ../../vista-native/main.dart lib/main.dart
+          python3 - <<'PY'
+          import plistlib
+          from pathlib import Path
+          p=Path('ios/Runner/Info.plist')
+          d=plistlib.loads(p.read_bytes())
+          d['NSAppTransportSecurity']={'NSAllowsArbitraryLoads': True}
+          p.write_bytes(plistlib.dumps(d))
+          PY
+          flutter pub get
+          flutter build ios --release --no-codesign
+      - name: Upload unsigned iOS build
+        uses: actions/upload-artifact@v4
+        with:
+          name: Vista-TV-iOS-Unsigned
+          path: build/vista_ios/build/ios/iphoneos/Runner.app
+          if-no-files-found: error

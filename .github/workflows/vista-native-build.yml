@@ -25,6 +25,45 @@ jobs:
           flutter create --platforms=windows --project-name vista_tv --org com.vistatv vista_build
           Copy-Item vista-native\main.dart vista_build\lib\main.dart -Force
           Copy-Item vista-native\pubspec.yaml vista_build\pubspec.yaml -Force
+
+          # Add an early native startup trace. If the process reaches wWinMain we will
+          # always have a log under %LOCALAPPDATA%\Vista TV\startup.log.
+          $mainCpp = 'vista_build\windows\runner\main.cpp'
+          $cpp = Get-Content $mainCpp -Raw
+          $cpp = $cpp -replace '#include <windows.h>', @'
+          #include <windows.h>
+          #include <fstream>
+          #include <filesystem>
+          '@
+          $cpp = $cpp -replace 'int APIENTRY wWinMain\(.*?\) \{', @'
+          int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev, _In_ wchar_t* command_line, _In_ int show_command) {
+            wchar_t localAppData[MAX_PATH] = {0};
+            std::wstring logPath;
+            if (GetEnvironmentVariableW(L"LOCALAPPDATA", localAppData, MAX_PATH) > 0) {
+              std::filesystem::path dir = std::filesystem::path(localAppData) / L"Vista TV";
+              std::error_code ec;
+              std::filesystem::create_directories(dir, ec);
+              logPath = (dir / L"startup.log").wstring();
+              std::wofstream log(logPath, std::ios::app);
+              log << L"Vista wWinMain entered\n";
+            }
+          '@
+          $cpp = $cpp -replace 'if \(!window\.Create\(L"vista_tv", origin, size\)\) \{\s*return EXIT_FAILURE;\s*\}', @'
+          if (!window.Create(L"Vista TV", origin, size)) {
+            if (!logPath.empty()) {
+              std::wofstream log(logPath, std::ios::app);
+              log << L"Flutter window creation failed\n";
+            }
+            MessageBoxW(nullptr, L"Vista TV could not create its window. Please send the file %LOCALAPPDATA%\\Vista TV\\startup.log.", L"Vista TV startup error", MB_OK | MB_ICONERROR);
+            return EXIT_FAILURE;
+          }
+          if (!logPath.empty()) {
+            std::wofstream log(logPath, std::ios::app);
+            log << L"Flutter window created\n";
+          }
+          '@
+          Set-Content $mainCpp $cpp -Encoding UTF8
+
           Set-Location vista_build
           flutter pub get
           $env:CL="/D_SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS"
@@ -34,21 +73,34 @@ jobs:
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
           $vsPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
           if (-not $vsPath) { throw 'Visual Studio C++ toolchain not found' }
-          $crt = Get-ChildItem "$vsPath\VC\Redist\MSVC" -Recurse -Filter msvcp140.dll |
-            Where-Object { $_.FullName -match '\\x64\\Microsoft\.VC.*\.CRT\\' } |
+
+          # Pick the newest full x64 CRT, explicitly excluding old OneCore redistributables.
+          $crtCandidates = Get-ChildItem "$vsPath\VC\Redist\MSVC" -Recurse -Filter msvcp140.dll |
+            Where-Object { $_.FullName -match '\\x64\\Microsoft\.VC.*\.CRT\\' -and $_.FullName -notmatch '\\onecore\\' }
+          if (-not $crtCandidates) { throw 'Full x64 Visual C++ runtime not found' }
+          $crt = $crtCandidates |
+            Sort-Object { try { [version]($_.FullName -replace '^.*?MSVC\\([^\\]+)\\.*$','$1') } catch { [version]'0.0' } } -Descending |
             Select-Object -First 1
-          if (-not $crt) { throw 'x64 Visual C++ redistributable runtime not found' }
           $crtDir = $crt.Directory.FullName
           Copy-Item "$crtDir\*.dll" $release -Force
-          Write-Host "Bundled VC++ runtime from $crtDir"
+          Write-Host "Bundled matching VC++ runtime from $crtDir"
+
+          # Also ship the official redistributable from the active compiler toolchain.
+          $vcRedist = Get-ChildItem "$vsPath\VC\Redist\MSVC" -Recurse -Filter VC_redist.x64.exe |
+            Where-Object { $_.FullName -notmatch '\\onecore\\' } |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1
+          if (-not $vcRedist) { throw 'VC_redist.x64.exe not found' }
 
           choco install innosetup -y --no-progress
           New-Item -ItemType Directory -Force installer | Out-Null
+          Copy-Item $vcRedist.FullName installer\VC_redist.x64.exe -Force
+
           $iss = @"
           [Setup]
           AppId={{8C8DD3E5-9582-4CD0-A83D-B998E31A61DA}
           AppName=Vista TV
-          AppVersion=0.1.0
+          AppVersion=0.1.1
           AppPublisher=Vista TV
           DefaultDirName={localappdata}\Programs\Vista TV
           DefaultGroupName=Vista TV
@@ -65,12 +117,14 @@ jobs:
 
           [Files]
           Source: "$release\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+          Source: "VC_redist.x64.exe"; DestDir: "{tmp}"; Flags: deleteafterinstall
 
           [Icons]
           Name: "{autoprograms}\Vista TV"; Filename: "{app}\vista_tv.exe"
           Name: "{autodesktop}\Vista TV"; Filename: "{app}\vista_tv.exe"
 
           [Run]
+          Filename: "{tmp}\VC_redist.x64.exe"; Parameters: "/install /quiet /norestart"; StatusMsg: "Installing Microsoft Visual C++ runtime..."; Flags: waituntilterminated
           Filename: "{app}\vista_tv.exe"; Description: "Open Vista TV"; Flags: nowait postinstall skipifsilent
           "@
           Set-Content -Path installer\vista.iss -Value $iss -Encoding UTF8

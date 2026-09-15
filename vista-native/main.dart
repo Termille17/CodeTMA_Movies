@@ -10,31 +10,81 @@ import 'package:media_kit_video/media_kit_video.dart';
 const vistaOrigin = 'https://vista-tv.vercel.app';
 
 const nativeBridge = r'''(() => {
+  window.__VISTA_NATIVE__ = true;
   if (window.__vistaNativeBridge) return;
   window.__vistaNativeBridge = true;
-  document.addEventListener('click', async (event) => {
-    const el = event.target?.closest?.('[data-vista-id]');
-    if (!el) return;
-    const id = String(el.dataset.vistaId || '');
-    const match = id.match(/^xtream-live-(.+)$/);
-    if (!match) return;
+
+  const liveIdFrom = (target) => {
+    const el = target?.closest?.('[data-vista-id],[data-vista],[data-stream-id],[data-live-id],[data-id],a[href*="/api/play/xtream/"]');
+    if (!el) return null;
+
+    const values = [
+      el.dataset?.vistaId,
+      el.dataset?.vista,
+      el.dataset?.streamId,
+      el.dataset?.liveId,
+      el.dataset?.id,
+      el.getAttribute?.('href')
+    ].filter(Boolean).map(String);
+
+    for (const raw of values) {
+      try {
+        if (raw.trim().startsWith('{')) {
+          const j = JSON.parse(raw);
+          const jt = String(j?.type || j?.kind || '').toLowerCase();
+          const jid = String(j?.id || j?.streamId || j?.stream_id || '');
+          if ((!jt || jt === 'live') && /^\d+$/.test(jid)) return {id: jid, el};
+        }
+      } catch (_) {}
+
+      let m = raw.match(/xtream-live-(\d+)/i);
+      if (m) return {id: m[1], el};
+      m = raw.match(/\/api\/play\/xtream\/(\d+)/i);
+      if (m) return {id: m[1], el};
+      m = raw.match(/(?:^|[|:_-])live(?:[|:_-]+(?:xtream)?[|:_-]*)?(\d+)(?:$|[|:_-])/i);
+      if (m) return {id: m[1], el};
+    }
+
+    const explicitType = String(el.dataset?.type || el.dataset?.kind || '').toLowerCase();
+    const numeric = String(el.dataset?.streamId || el.dataset?.liveId || el.dataset?.id || '');
+    if (explicitType === 'live' && /^\d+$/.test(numeric)) return {id: numeric, el};
+    return null;
+  };
+
+  const intercept = async (event) => {
+    const hit = liveIdFrom(event.target);
+    if (!hit) return;
+
     event.preventDefault();
     event.stopPropagation();
     event.stopImmediatePropagation();
-    const playbackId = match[1];
-    const title = (el.dataset.title || el.querySelector('.media-title')?.textContent || el.querySelector('h4')?.textContent || el.querySelector('strong')?.textContent || 'Vista Live').trim();
+
+    const {id: playbackId, el} = hit;
+    const title = (
+      el.dataset?.title ||
+      el.querySelector?.('.media-title')?.textContent ||
+      el.querySelector?.('h4')?.textContent ||
+      el.querySelector?.('strong')?.textContent ||
+      'Vista Live'
+    ).trim();
+
     try {
-      const r = await fetch(`/api/native/play-url/${encodeURIComponent(playbackId)}?kind=live&ext=ts`, {cache:'no-store', credentials:'include'});
+      const r = await fetch(`/api/native/play-url/${encodeURIComponent(playbackId)}?kind=live&ext=ts`, {
+        cache: 'no-store',
+        credentials: 'include'
+      });
       if (!r.ok) throw new Error(`Vista playback ${r.status}`);
       const data = await r.json();
       if (!data?.url) throw new Error('Missing Vista playback URL');
-      await window.flutter_inappwebview.callHandler('vistaPlay', {url:data.url, title});
+      await window.flutter_inappwebview.callHandler('vistaPlay', {url: data.url, title});
     } catch (e) {
       console.error('Vista native playback failed', e);
       const badge = document.querySelector('#vistaConnection');
       if (badge) badge.textContent = 'NATIVE PLAYBACK ERROR';
     }
-  }, true);
+  };
+
+  document.addEventListener('click', intercept, true);
 })();''';
 
 Future<void> main() async {
@@ -62,6 +112,7 @@ class VistaShell extends StatefulWidget {
 
 class _VistaShellState extends State<VistaShell> {
   double progress = 0;
+  InAppWebViewController? webController;
 
   Future<void> openPlayer(dynamic value) async {
     if (value is! Map) return;
@@ -69,6 +120,10 @@ class _VistaShellState extends State<VistaShell> {
     if (url == null || !url.startsWith(vistaOrigin) || !mounted) return;
     final title = value['title']?.toString() ?? 'Vista Live';
     await Navigator.of(context).push(MaterialPageRoute(builder: (_) => VistaPlayer(url: url, title: title)));
+  }
+
+  Future<void> loadVistaRoot() async {
+    await webController?.loadUrl(urlRequest: URLRequest(url: WebUri(vistaOrigin)));
   }
 
   @override
@@ -90,6 +145,7 @@ class _VistaShellState extends State<VistaShell> {
             supportZoom: false,
           ),
           onWebViewCreated: (controller) {
+            webController = controller;
             controller.addJavaScriptHandler(
               handlerName: 'vistaPlay',
               callback: (args) async {
@@ -98,10 +154,27 @@ class _VistaShellState extends State<VistaShell> {
               },
             );
           },
+          onLoadStop: (controller, url) async {
+            final uri = Uri.tryParse(url?.toString() ?? '');
+            if (uri != null && uri.host == 'vista-tv.vercel.app' && uri.path == '/login') {
+              await loadVistaRoot();
+              return;
+            }
+            await controller.evaluateJavascript(source: nativeBridge);
+          },
           onProgressChanged: (_, p) { if (mounted) setState(() => progress = p / 100); },
           shouldOverrideUrlLoading: (_, action) async {
-            final url = action.request.url?.toString();
-            return url != null && url.startsWith(vistaOrigin) ? NavigationActionPolicy.ALLOW : NavigationActionPolicy.CANCEL;
+            final raw = action.request.url?.toString();
+            if (raw == null) return NavigationActionPolicy.CANCEL;
+            final uri = Uri.tryParse(raw);
+            if (uri == null || uri.host != 'vista-tv.vercel.app') return NavigationActionPolicy.CANCEL;
+            if (uri.path == '/login') {
+              await loadVistaRoot();
+              return NavigationActionPolicy.CANCEL;
+            }
+            // A native Vista build must never navigate the WebView into a stream URL.
+            if (uri.path.startsWith('/api/play/')) return NavigationActionPolicy.CANCEL;
+            return NavigationActionPolicy.ALLOW;
           },
         ),
       ),

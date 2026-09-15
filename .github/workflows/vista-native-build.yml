@@ -53,7 +53,7 @@ jobs:
           DefaultDirName={localappdata}\Programs\Vista TV
           DefaultGroupName=Vista TV
           UninstallDisplayIcon={app}\vista_tv.exe
-          OutputDir=installer
+          OutputDir=.
           OutputBaseFilename=Vista-TV-Setup
           Compression=lzma2
           SolidCompression=yes

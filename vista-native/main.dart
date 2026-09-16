@@ -63,7 +63,6 @@ const nativeBridge = r'''(() => {
         const kind = m[1].toLowerCase();
         return {id: m[2], kind, ext: kind === 'live' ? 'ts' : 'mp4', title: '', el};
       }
-
       m = raw.match(/\/api\/play\/xtream\/(\d+)(?:\?([^#]+))?/i);
       if (m) {
         const qs = new URLSearchParams(m[2] || '');
@@ -300,17 +299,20 @@ class VistaPlayer extends StatefulWidget {
 class _VistaPlayerState extends State<VistaPlayer> {
   late final Player player;
   late final VideoController controller;
-  StreamSubscription<bool>? playingSub;
-  StreamSubscription<bool>? completedSub;
-  StreamSubscription<String>? errorSub;
-  Timer? attemptTimer;
-  Timer? reconnectTimer;
 
+  StreamSubscription<String>? errorSub;
+  StreamSubscription<PlayerLog>? logSub;
+  StreamSubscription<int?>? widthSub;
+  StreamSubscription<int?>? heightSub;
+  StreamSubscription<bool>? completedSub;
+  Timer? attemptTimer;
+
+  final List<String> nativeLogs = <String>[];
   String? directUrl;
   String? lastError;
   String phase = 'connecting';
-  int reconnectAttempts = 0;
-  bool hasPlayed = false;
+  int attempt = 0;
+  bool sawVideo = false;
   bool disposed = false;
 
   @override
@@ -327,35 +329,62 @@ class _VistaPlayerState extends State<VistaPlayer> {
       ]);
     }
 
-    playingSub = player.stream.playing.listen((playing) {
-      if (!playing || disposed) return;
-      attemptTimer?.cancel();
-      hasPlayed = true;
-      reconnectAttempts = 0;
-      lastError = null;
-      phase = 'playing';
-      if (mounted) setState(() {});
+    logSub = player.stream.log.listen((entry) {
+      if (disposed) return;
+      final text = entry.text.trim();
+      if (text.isEmpty) return;
+      final level = entry.level.toLowerCase();
+      final interesting = level.contains('error') ||
+          level.contains('warn') ||
+          text.toLowerCase().contains('http') ||
+          text.toLowerCase().contains('failed') ||
+          text.toLowerCase().contains('error') ||
+          text.toLowerCase().contains('eof') ||
+          text.toLowerCase().contains('lavf') ||
+          text.toLowerCase().contains('demux');
+      if (!interesting) return;
+      nativeLogs.add('[${entry.prefix}/${entry.level}] $text');
+      while (nativeLogs.length > 8) {
+        nativeLogs.removeAt(0);
+      }
+      if (mounted && phase != 'playing') setState(() {});
     });
 
-    completedSub = player.stream.completed.listen((done) {
-      if (done && !disposed && widget.isLive && phase == 'playing' && hasPlayed) {
-        scheduleReconnect('The live stream ended unexpectedly.');
-      }
+    widthSub = player.stream.width.listen((value) {
+      if (value != null && value > 0) markVideoStarted();
+    });
+    heightSub = player.stream.height.listen((value) {
+      if (value != null && value > 0) markVideoStarted();
     });
 
     errorSub = player.stream.error.listen((message) {
-      if (disposed) return;
+      if (disposed || sawVideo) {
+        if (!disposed && sawVideo) failPlayback(message);
+        return;
+      }
       lastError = message;
-      if (phase == 'playing' && widget.isLive && hasPlayed) {
-        scheduleReconnect(message);
-      } else if (phase == 'reconnecting' && widget.isLive) {
-        scheduleReconnect(message);
+      handleAttemptFailure(message);
+    });
+
+    completedSub = player.stream.completed.listen((done) {
+      if (!done || disposed) return;
+      if (sawVideo) {
+        failPlayback('The provider ended the live stream.');
       } else {
-        failPlayback(message);
+        handleAttemptFailure('The stream ended before Vista received a video frame.');
       }
     });
 
-    startPlayback();
+    startAttempt(0);
+  }
+
+  void markVideoStarted() {
+    if (disposed || sawVideo) return;
+    sawVideo = true;
+    attemptTimer?.cancel();
+    phase = 'playing';
+    lastError = null;
+    if (mounted) setState(() {});
   }
 
   Future<String> resolveProviderUrl(String signedUrl) async {
@@ -387,92 +416,90 @@ class _VistaPlayerState extends State<VistaPlayer> {
     }
   }
 
-  Future<void> configureNativeTransport() async {
+  Future<void> configureAttempt(int mode) async {
     await setNativeProperty('network-timeout', '30');
     await setNativeProperty('cache', 'yes');
-    await setNativeProperty('demuxer-readahead-secs', widget.isLive ? '3' : '15');
+    await setNativeProperty('demuxer-readahead-secs', widget.isLive ? '4' : '15');
+    if (widget.isLive && mode == 1) {
+      await setNativeProperty('demuxer-lavf-format', 'mpegts');
+      await setNativeProperty('demuxer-lavf-probescore', '25');
+      await setNativeProperty('cache-pause', 'no');
+    } else {
+      await setNativeProperty('demuxer-lavf-format', '');
+    }
   }
 
-  void startAttemptTimeout({required bool reconnecting}) {
+  Future<void> startAttempt(int mode) async {
+    if (disposed) return;
     attemptTimer?.cancel();
-    attemptTimer = Timer(const Duration(seconds: 12), () {
-      if (disposed || phase == 'playing') return;
-      const timeoutMessage = 'The provider did not start sending playable video within 12 seconds.';
-      if (reconnecting && reconnectAttempts < 3) {
-        scheduleReconnect(timeoutMessage);
-      } else {
-        failPlayback(lastError ?? timeoutMessage);
-      }
-    });
-  }
-
-  Future<void> startPlayback() async {
-    reconnectTimer?.cancel();
-    attemptTimer?.cancel();
-    phase = 'connecting';
+    attempt = mode;
+    sawVideo = false;
     lastError = null;
-    hasPlayed = false;
+    phase = mode == 0 ? 'connecting' : 'compatibility';
     if (mounted) setState(() {});
 
     try {
-      directUrl = await resolveProviderUrl(widget.url);
-      if (disposed) return;
-      await configureNativeTransport();
-      startAttemptTimeout(reconnecting: false);
-      await player.open(Media(directUrl!), play: true);
+      await player.stop();
+    } catch (_) {}
+
+    try {
+      await configureAttempt(mode);
+      String target = widget.url;
+      if (widget.isLive && mode == 1) {
+        directUrl ??= await resolveProviderUrl(widget.url);
+        target = directUrl!;
+      }
+      await player.open(Media(target), play: true);
+      attemptTimer = Timer(const Duration(seconds: 15), () {
+        if (disposed || sawVideo) return;
+        handleAttemptFailure(
+          lastError ?? 'No playable video frame arrived within 15 seconds.',
+        );
+      });
     } catch (e) {
-      failPlayback(e.toString());
+      handleAttemptFailure(e.toString());
     }
   }
 
-  void scheduleReconnect(String reason) {
-    if (disposed || !widget.isLive) return;
+  Future<void> handleAttemptFailure(String reason) async {
+    if (disposed || sawVideo) return;
     attemptTimer?.cancel();
-    reconnectTimer?.cancel();
     lastError = reason;
 
-    if (reconnectAttempts >= 3) {
-      failPlayback(reason);
+    if (widget.isLive && attempt == 0) {
+      phase = 'compatibility';
+      if (mounted) setState(() {});
+      await Future.delayed(const Duration(milliseconds: 900));
+      if (!disposed) await startAttempt(1);
       return;
     }
 
-    reconnectAttempts += 1;
-    phase = 'reconnecting';
-    if (mounted) setState(() {});
-
-    reconnectTimer = Timer(Duration(seconds: reconnectAttempts), () async {
-      if (disposed || directUrl == null) return;
-      try {
-        startAttemptTimeout(reconnecting: true);
-        await player.open(Media(directUrl!), play: true);
-      } catch (e) {
-        scheduleReconnect(e.toString());
-      }
-    });
+    failPlayback(reason);
   }
 
   void failPlayback(String message) {
+    if (disposed) return;
     attemptTimer?.cancel();
-    reconnectTimer?.cancel();
     lastError = message.isEmpty ? 'Unknown native playback error.' : message;
     phase = 'failed';
     if (mounted) setState(() {});
   }
 
   Future<void> retryFromUser() async {
-    reconnectAttempts = 0;
+    nativeLogs.clear();
     directUrl = null;
-    await startPlayback();
+    await startAttempt(0);
   }
 
   @override
   void dispose() {
     disposed = true;
     attemptTimer?.cancel();
-    reconnectTimer?.cancel();
-    playingSub?.cancel();
-    completedSub?.cancel();
     errorSub?.cancel();
+    logSub?.cancel();
+    widthSub?.cancel();
+    heightSub?.cancel();
+    completedSub?.cancel();
     if (!Platform.isWindows) {
       SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
       SystemChrome.setPreferredOrientations(DeviceOrientation.values);
@@ -482,9 +509,17 @@ class _VistaPlayerState extends State<VistaPlayer> {
   }
 
   String get statusText {
-    if (phase == 'connecting') return widget.isLive ? 'Vista is connecting to live TV…' : 'Vista is opening this movie…';
-    if (phase == 'reconnecting') return 'Live connection dropped. Reconnecting ($reconnectAttempts/3)…';
-    if (phase == 'failed') return lastError ?? 'Vista could not start playback.';
+    if (phase == 'connecting') {
+      return widget.isLive
+          ? 'Vista is opening the live stream…'
+          : 'Vista is opening this movie…';
+    }
+    if (phase == 'compatibility') {
+      return 'Vista is trying MPEG-TS compatibility mode…';
+    }
+    if (phase == 'failed') {
+      return lastError ?? 'Vista could not start playback.';
+    }
     return '';
   }
 
@@ -526,7 +561,7 @@ class _VistaPlayerState extends State<VistaPlayer> {
             if (phase != 'playing')
               Center(
                 child: Container(
-                  constraints: const BoxConstraints(maxWidth: 620),
+                  constraints: const BoxConstraints(maxWidth: 720),
                   margin: const EdgeInsets.all(24),
                   padding: const EdgeInsets.all(20),
                   decoration: BoxDecoration(
@@ -550,6 +585,28 @@ class _VistaPlayerState extends State<VistaPlayer> {
                         textAlign: TextAlign.center,
                         style: const TextStyle(fontSize: 14, color: Colors.white70),
                       ),
+                      if (phase == 'failed' && nativeLogs.isNotEmpty) ...[
+                        const SizedBox(height: 14),
+                        Container(
+                          width: double.infinity,
+                          constraints: const BoxConstraints(maxHeight: 220),
+                          padding: const EdgeInsets.all(12),
+                          decoration: BoxDecoration(
+                            color: Colors.black38,
+                            borderRadius: BorderRadius.circular(10),
+                          ),
+                          child: SingleChildScrollView(
+                            child: SelectableText(
+                              nativeLogs.join('\n'),
+                              style: const TextStyle(
+                                fontFamily: 'Consolas',
+                                fontSize: 11,
+                                color: Colors.white60,
+                              ),
+                            ),
+                          ),
+                        ),
+                      ],
                       if (phase == 'failed') ...[
                         const SizedBox(height: 16),
                         FilledButton.icon(

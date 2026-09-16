@@ -69,13 +69,13 @@ jobs:
           [Setup]
           AppId={{A53D1E41-EB50-48E2-961B-D9FF5D42B4A2}
           AppName=Vista TV
-          AppVersion=0.1.2
+          AppVersion=0.1.3
           AppPublisher=Vista TV
           DefaultDirName={localappdata}\Programs\VistaTV
           DefaultGroupName=Vista TV
           UninstallDisplayIcon={app}\VistaTV.exe
           OutputDir=.
-          OutputBaseFilename=Vista-TV-Setup-0.1.2
+          OutputBaseFilename=Vista-TV-Setup-0.1.3
           Compression=lzma2
           SolidCompression=yes
           ArchitecturesAllowed=x64compatible
@@ -84,6 +84,9 @@ jobs:
           WizardStyle=modern
           DisableProgramGroupPage=yes
           UsePreviousAppDir=no
+          CloseApplications=yes
+          CloseApplicationsFilter=*.exe,*.dll,*.chm
+          RestartApplications=no
 
           [InstallDelete]
           Type: files; Name: "{userdesktop}\Vista TV.lnk"
@@ -101,6 +104,16 @@ jobs:
           [Run]
           Filename: "{tmp}\VC_redist.x64.exe"; Parameters: "/install /quiet /norestart"; StatusMsg: "Installing Microsoft Visual C++ runtime..."; Flags: waituntilterminated
           Filename: "{app}\VistaTV.exe"; Description: "Open Vista TV"; WorkingDir: "{app}"; Flags: nowait postinstall skipifsilent
+
+          [Code]
+          function PrepareToInstall(var NeedsRestart: Boolean): String;
+          var
+            ResultCode: Integer;
+          begin
+            Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM VistaTV.exe', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+            Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM vista_tv.exe', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+            Result := '';
+          end;
           "@
           Set-Content -Path installer\vista.iss -Value $iss -Encoding UTF8
           $iscc = @(
@@ -109,12 +122,12 @@ jobs:
           ) | Where-Object { Test-Path $_ } | Select-Object -First 1
           if (-not $iscc) { throw 'Inno Setup compiler not found' }
           & $iscc installer\vista.iss
-          if (-not (Test-Path installer\Vista-TV-Setup-0.1.2.exe)) { throw 'Installer was not created' }
+          if (-not (Test-Path installer\Vista-TV-Setup-0.1.3.exe)) { throw 'Installer was not created' }
 
       - uses: actions/upload-artifact@v4
         with:
           name: Vista-TV-Windows-Installer
-          path: vista_build/installer/Vista-TV-Setup-0.1.2.exe
+          path: vista_build/installer/Vista-TV-Setup-0.1.3.exe
           if-no-files-found: error
       - uses: actions/upload-artifact@v4
         with:

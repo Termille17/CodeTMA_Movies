@@ -9,7 +9,6 @@ import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
 
 const vistaOrigin = 'https://vista-tv.vercel.app';
-const vistaIptvUserAgent = 'VLC/3.0.21 LibVLC/3.0.21';
 
 const nativeBridge = r'''(() => {
   window.__VISTA_NATIVE__ = true;
@@ -17,8 +16,6 @@ const nativeBridge = r'''(() => {
   window.__vistaNativeBridge = true;
   window.__vistaNativeMedia = window.__vistaNativeMedia || new Map();
 
-  // Observe Vista's real catalogue responses so native playback receives the
-  // exact kind, playback id & provider container extension for every item.
   const originalFetch = window.fetch.bind(window);
   window.fetch = async (...args) => {
     const response = await originalFetch(...args);
@@ -62,7 +59,10 @@ const nativeBridge = r'''(() => {
 
     for (const raw of values) {
       let m = raw.match(/xtream-(live|movie)-(\d+)/i);
-      if (m) return {id: m[2], kind: m[1].toLowerCase(), ext: m[1].toLowerCase() === 'live' ? 'ts' : 'mp4', title: '', el};
+      if (m) {
+        const kind = m[1].toLowerCase();
+        return {id: m[2], kind, ext: kind === 'live' ? 'ts' : 'mp4', title: '', el};
+      }
 
       m = raw.match(/\/api\/play\/xtream\/(\d+)(?:\?([^#]+))?/i);
       if (m) {
@@ -104,7 +104,12 @@ const nativeBridge = r'''(() => {
       if (!r.ok) throw new Error(`Vista playback ${r.status}`);
       const data = await r.json();
       if (!data?.url) throw new Error('Missing Vista playback URL');
-      await window.flutter_inappwebview.callHandler('vistaPlay', {url: data.url, title, kind, ext});
+      await window.flutter_inappwebview.callHandler('vistaPlay', {
+        url: data.url,
+        title,
+        kind,
+        ext,
+      });
     } catch (e) {
       console.error('Vista native playback failed', e);
       const badge = document.querySelector('#vistaConnection');
@@ -164,9 +169,7 @@ class _VistaShellState extends State<VistaShell> {
 
   Future<void> loadVistaRoot() async {
     if (!mounted) return;
-    await webController?.loadUrl(
-      urlRequest: URLRequest(url: WebUri(vistaOrigin)),
-    );
+    await webController?.loadUrl(urlRequest: URLRequest(url: WebUri(vistaOrigin)));
   }
 
   void scheduleVistaRetry() {
@@ -175,8 +178,7 @@ class _VistaShellState extends State<VistaShell> {
     final delayMs = 700 + (retryCount * 650);
     retryCount += 1;
     retryTimer = Timer(Duration(milliseconds: delayMs), () async {
-      if (!mounted) return;
-      await loadVistaRoot();
+      if (mounted) await loadVistaRoot();
     });
   }
 
@@ -227,7 +229,6 @@ class _VistaShellState extends State<VistaShell> {
                       return {'ok': true};
                     },
                   );
-
                   if (!initialLoadStarted) {
                     initialLoadStarted = true;
                     Future.delayed(const Duration(milliseconds: 1200), () async {
@@ -235,17 +236,14 @@ class _VistaShellState extends State<VistaShell> {
                     });
                   }
                 },
-                onLoadStart: (_, __) {
-                  retryTimer?.cancel();
-                },
+                onLoadStart: (_, __) => retryTimer?.cancel(),
                 onLoadStop: (controller, url) async {
                   retryTimer?.cancel();
                   retryCount = 0;
                   await controller.evaluateJavascript(source: nativeBridge);
                 },
                 onReceivedError: (_, request, error) {
-                  final isMainFrame = request.isForMainFrame == true;
-                  if (isMainFrame && isTransientNetworkError(error)) {
+                  if (request.isForMainFrame == true && isTransientNetworkError(error)) {
                     scheduleVistaRetry();
                   }
                 },
@@ -259,7 +257,6 @@ class _VistaShellState extends State<VistaShell> {
                   if (uri == null || uri.host != 'vista-tv.vercel.app') {
                     return NavigationActionPolicy.CANCEL;
                   }
-                  // Browser playback is never allowed inside the native shell.
                   if (uri.path.startsWith('/api/play/')) {
                     return NavigationActionPolicy.CANCEL;
                   }
@@ -303,12 +300,17 @@ class VistaPlayer extends StatefulWidget {
 class _VistaPlayerState extends State<VistaPlayer> {
   late final Player player;
   late final VideoController controller;
+  StreamSubscription<bool>? playingSub;
   StreamSubscription<bool>? completedSub;
   StreamSubscription<String>? errorSub;
+  Timer? attemptTimer;
   Timer? reconnectTimer;
+
   String? directUrl;
   String? lastError;
+  String phase = 'connecting';
   int reconnectAttempts = 0;
+  bool hasPlayed = false;
   bool disposed = false;
 
   @override
@@ -316,6 +318,7 @@ class _VistaPlayerState extends State<VistaPlayer> {
     super.initState();
     player = Player();
     controller = VideoController(player);
+
     if (!Platform.isWindows) {
       SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
       SystemChrome.setPreferredOrientations([
@@ -324,30 +327,50 @@ class _VistaPlayerState extends State<VistaPlayer> {
       ]);
     }
 
-    completedSub = player.stream.completed.listen((done) {
-      if (done && widget.isLive) scheduleReconnect();
-    });
-    errorSub = player.stream.error.listen((message) {
-      lastError = message;
+    playingSub = player.stream.playing.listen((playing) {
+      if (!playing || disposed) return;
+      attemptTimer?.cancel();
+      hasPlayed = true;
+      reconnectAttempts = 0;
+      lastError = null;
+      phase = 'playing';
       if (mounted) setState(() {});
-      if (widget.isLive) scheduleReconnect();
+    });
+
+    completedSub = player.stream.completed.listen((done) {
+      if (done && !disposed && widget.isLive && phase == 'playing' && hasPlayed) {
+        scheduleReconnect('The live stream ended unexpectedly.');
+      }
+    });
+
+    errorSub = player.stream.error.listen((message) {
+      if (disposed) return;
+      lastError = message;
+      if (phase == 'playing' && widget.isLive && hasPlayed) {
+        scheduleReconnect(message);
+      } else if (phase == 'reconnecting' && widget.isLive) {
+        scheduleReconnect(message);
+      } else {
+        failPlayback(message);
+      }
     });
 
     startPlayback();
   }
 
   Future<String> resolveProviderUrl(String signedUrl) async {
-    final client = HttpClient();
-    client.userAgent = vistaIptvUserAgent;
+    final client = HttpClient()..connectionTimeout = const Duration(seconds: 15);
     try {
       final request = await client.getUrl(Uri.parse(signedUrl));
       request.followRedirects = false;
-      request.headers.set(HttpHeaders.acceptHeader, '*/*');
       final response = await request.close().timeout(const Duration(seconds: 15));
       final location = response.headers.value(HttpHeaders.locationHeader);
       await response.drain();
       if (location != null && response.statusCode >= 300 && response.statusCode < 400) {
         return Uri.parse(signedUrl).resolve(location).toString();
+      }
+      if (response.statusCode >= 400) {
+        throw HttpException('Vista playback authorization returned HTTP ${response.statusCode}');
       }
       return signedUrl;
     } finally {
@@ -360,71 +383,94 @@ class _VistaPlayerState extends State<VistaPlayer> {
     if (platform is NativePlayer) {
       try {
         await platform.setProperty(name, value);
-      } catch (_) {
-        // Some bundled mpv builds do not expose every option; playback must
-        // continue even when an optional tuning property is unavailable.
-      }
+      } catch (_) {}
     }
   }
 
   Future<void> configureNativeTransport() async {
-    await setNativeProperty('user-agent', vistaIptvUserAgent);
-    await setNativeProperty('network-timeout', '90');
+    await setNativeProperty('network-timeout', '30');
     await setNativeProperty('cache', 'yes');
-    await setNativeProperty('demuxer-readahead-secs', widget.isLive ? '6' : '20');
-    if (widget.isLive) {
-      await setNativeProperty(
-        'stream-lavf-o',
-        'reconnect=1,reconnect_streamed=1,reconnect_on_network_error=1,reconnect_delay_max=5,multiple_requests=1',
-      );
-    }
+    await setNativeProperty('demuxer-readahead-secs', widget.isLive ? '3' : '15');
   }
 
-  Media mediaFor(String url) => Media(
-        url,
-        httpHeaders: const {
-          'User-Agent': vistaIptvUserAgent,
-          'Accept': '*/*',
-          'Connection': 'keep-alive',
-        },
-      );
-
-  Future<void> startPlayback() async {
-    try {
-      directUrl ??= await resolveProviderUrl(widget.url);
-      if (disposed) return;
-      await configureNativeTransport();
-      await player.open(mediaFor(directUrl!), play: true);
-      reconnectAttempts = 0;
-      lastError = null;
-      if (mounted) setState(() {});
-    } catch (e) {
-      lastError = e.toString();
-      if (mounted) setState(() {});
-      if (widget.isLive) scheduleReconnect();
-    }
-  }
-
-  void scheduleReconnect() {
-    if (disposed || !widget.isLive || reconnectTimer?.isActive == true) return;
-    final seconds = reconnectAttempts < 2 ? 1 : (reconnectAttempts < 5 ? 2 : 4);
-    reconnectAttempts += 1;
-    reconnectTimer = Timer(Duration(seconds: seconds), () async {
-      if (disposed || directUrl == null) return;
-      try {
-        await player.open(mediaFor(directUrl!), play: true);
-      } catch (e) {
-        lastError = e.toString();
-        if (mounted) setState(() {});
-        scheduleReconnect();
+  void startAttemptTimeout({required bool reconnecting}) {
+    attemptTimer?.cancel();
+    attemptTimer = Timer(const Duration(seconds: 12), () {
+      if (disposed || phase == 'playing') return;
+      const timeoutMessage = 'The provider did not start sending playable video within 12 seconds.';
+      if (reconnecting && reconnectAttempts < 3) {
+        scheduleReconnect(timeoutMessage);
+      } else {
+        failPlayback(lastError ?? timeoutMessage);
       }
     });
+  }
+
+  Future<void> startPlayback() async {
+    reconnectTimer?.cancel();
+    attemptTimer?.cancel();
+    phase = 'connecting';
+    lastError = null;
+    hasPlayed = false;
+    if (mounted) setState(() {});
+
+    try {
+      directUrl = await resolveProviderUrl(widget.url);
+      if (disposed) return;
+      await configureNativeTransport();
+      startAttemptTimeout(reconnecting: false);
+      await player.open(Media(directUrl!), play: true);
+    } catch (e) {
+      failPlayback(e.toString());
+    }
+  }
+
+  void scheduleReconnect(String reason) {
+    if (disposed || !widget.isLive) return;
+    attemptTimer?.cancel();
+    reconnectTimer?.cancel();
+    lastError = reason;
+
+    if (reconnectAttempts >= 3) {
+      failPlayback(reason);
+      return;
+    }
+
+    reconnectAttempts += 1;
+    phase = 'reconnecting';
+    if (mounted) setState(() {});
+
+    reconnectTimer = Timer(Duration(seconds: reconnectAttempts), () async {
+      if (disposed || directUrl == null) return;
+      try {
+        startAttemptTimeout(reconnecting: true);
+        await player.open(Media(directUrl!), play: true);
+      } catch (e) {
+        scheduleReconnect(e.toString());
+      }
+    });
+  }
+
+  void failPlayback(String message) {
+    attemptTimer?.cancel();
+    reconnectTimer?.cancel();
+    lastError = message.isEmpty ? 'Unknown native playback error.' : message;
+    phase = 'failed';
+    if (mounted) setState(() {});
+  }
+
+  Future<void> retryFromUser() async {
+    reconnectAttempts = 0;
+    directUrl = null;
+    await startPlayback();
   }
 
   @override
   void dispose() {
     disposed = true;
+    attemptTimer?.cancel();
     reconnectTimer?.cancel();
+    playingSub?.cancel();
     completedSub?.cancel();
     errorSub?.cancel();
     if (!Platform.isWindows) {
@@ -433,6 +479,13 @@ class _VistaPlayerState extends State<VistaPlayer> {
     }
     player.dispose();
     super.dispose();
+  }
+
+  String get statusText {
+    if (phase == 'connecting') return widget.isLive ? 'Vista is connecting to live TV…' : 'Vista is opening this movie…';
+    if (phase == 'reconnecting') return 'Live connection dropped. Reconnecting ($reconnectAttempts/3)…';
+    if (phase == 'failed') return lastError ?? 'Vista could not start playback.';
+    return '';
   }
 
   @override
@@ -470,27 +523,42 @@ class _VistaPlayerState extends State<VistaPlayer> {
                 ),
               ),
             ),
-            if (lastError != null)
-              Positioned(
-                left: 24,
-                right: 24,
-                bottom: 24,
-                child: SafeArea(
-                  child: DecoratedBox(
-                    decoration: BoxDecoration(
-                      color: const Color(0xCC111318),
-                      borderRadius: BorderRadius.circular(14),
-                    ),
-                    child: Padding(
-                      padding: const EdgeInsets.all(12),
-                      child: Text(
-                        widget.isLive
-                            ? 'Vista is reconnecting to this live channel…'
-                            : 'Vista could not open this movie: $lastError',
+            if (phase != 'playing')
+              Center(
+                child: Container(
+                  constraints: const BoxConstraints(maxWidth: 620),
+                  margin: const EdgeInsets.all(24),
+                  padding: const EdgeInsets.all(20),
+                  decoration: BoxDecoration(
+                    color: const Color(0xE6111318),
+                    borderRadius: BorderRadius.circular(18),
+                    border: Border.all(color: Colors.white12),
+                  ),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      if (phase != 'failed') ...[
+                        const SizedBox(
+                          width: 22,
+                          height: 22,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        ),
+                        const SizedBox(height: 14),
+                      ],
+                      Text(
+                        statusText,
                         textAlign: TextAlign.center,
-                        style: const TextStyle(fontSize: 12, color: Colors.white70),
+                        style: const TextStyle(fontSize: 14, color: Colors.white70),
                       ),
-                    ),
+                      if (phase == 'failed') ...[
+                        const SizedBox(height: 16),
+                        FilledButton.icon(
+                          onPressed: retryFromUser,
+                          icon: const Icon(Icons.refresh_rounded),
+                          label: const Text('Retry'),
+                        ),
+                      ],
+                    ],
                   ),
                 ),
               ),

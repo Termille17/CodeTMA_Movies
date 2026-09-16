@@ -9,75 +9,102 @@ import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
 
 const vistaOrigin = 'https://vista-tv.vercel.app';
+const vistaIptvUserAgent = 'VLC/3.0.21 LibVLC/3.0.21';
 
 const nativeBridge = r'''(() => {
   window.__VISTA_NATIVE__ = true;
   if (window.__vistaNativeBridge) return;
   window.__vistaNativeBridge = true;
+  window.__vistaNativeMedia = window.__vistaNativeMedia || new Map();
 
-  const liveIdFrom = (target) => {
+  // Observe Vista's real catalogue responses so native playback receives the
+  // exact kind, playback id & provider container extension for every item.
+  const originalFetch = window.fetch.bind(window);
+  window.fetch = async (...args) => {
+    const response = await originalFetch(...args);
+    try {
+      const raw = String(typeof args[0] === 'string' ? args[0] : (args[0]?.url || ''));
+      if (/\/api\/catalog\/(live|movies|series)/.test(raw)) {
+        response.clone().json().then((data) => {
+          for (const item of (data?.items || [])) {
+            if (item?.id) window.__vistaNativeMedia.set(String(item.id), item);
+          }
+        }).catch(() => {});
+      }
+    } catch (_) {}
+    return response;
+  };
+
+  const itemFrom = (target) => {
     const el = target?.closest?.('[data-vista-id],[data-vista],[data-stream-id],[data-live-id],[data-id],a[href*="/api/play/xtream/"]');
     if (!el) return null;
 
+    const vistaId = String(el.dataset?.vistaId || '');
+    const cached = vistaId ? window.__vistaNativeMedia.get(vistaId) : null;
+    if (cached) {
+      return {
+        id: String(cached.playbackId || cached.streamId || cached.id || ''),
+        kind: String(cached.kind || 'live').toLowerCase(),
+        ext: String(cached.containerExtension || (cached.kind === 'live' ? 'ts' : 'mp4')),
+        title: String(cached.name || ''),
+        el,
+      };
+    }
+
     const values = [
-      el.dataset?.vistaId,
+      vistaId,
       el.dataset?.vista,
       el.dataset?.streamId,
       el.dataset?.liveId,
       el.dataset?.id,
-      el.getAttribute?.('href')
+      el.getAttribute?.('href'),
     ].filter(Boolean).map(String);
 
     for (const raw of values) {
-      try {
-        if (raw.trim().startsWith('{')) {
-          const j = JSON.parse(raw);
-          const jt = String(j?.type || j?.kind || '').toLowerCase();
-          const jid = String(j?.id || j?.streamId || j?.stream_id || '');
-          if ((!jt || jt === 'live') && /^\d+$/.test(jid)) return {id: jid, el};
-        }
-      } catch (_) {}
+      let m = raw.match(/xtream-(live|movie)-(\d+)/i);
+      if (m) return {id: m[2], kind: m[1].toLowerCase(), ext: m[1].toLowerCase() === 'live' ? 'ts' : 'mp4', title: '', el};
 
-      let m = raw.match(/xtream-live-(\d+)/i);
-      if (m) return {id: m[1], el};
-      m = raw.match(/\/api\/play\/xtream\/(\d+)/i);
-      if (m) return {id: m[1], el};
-      m = raw.match(/(?:^|[|:_-])live(?:[|:_-]+(?:xtream)?[|:_-]*)?(\d+)(?:$|[|:_-])/i);
-      if (m) return {id: m[1], el};
+      m = raw.match(/\/api\/play\/xtream\/(\d+)(?:\?([^#]+))?/i);
+      if (m) {
+        const qs = new URLSearchParams(m[2] || '');
+        const kind = String(qs.get('kind') || 'live').toLowerCase();
+        return {id: m[1], kind, ext: qs.get('ext') || (kind === 'live' ? 'ts' : 'mp4'), title: '', el};
+      }
     }
-
-    const explicitType = String(el.dataset?.type || el.dataset?.kind || '').toLowerCase();
-    const numeric = String(el.dataset?.streamId || el.dataset?.liveId || el.dataset?.id || '');
-    if (explicitType === 'live' && /^\d+$/.test(numeric)) return {id: numeric, el};
     return null;
   };
 
   const intercept = async (event) => {
-    const hit = liveIdFrom(event.target);
-    if (!hit) return;
+    const hit = itemFrom(event.target);
+    if (!hit || !/^\d+$/.test(hit.id) || hit.kind === 'series') return;
 
     event.preventDefault();
     event.stopPropagation();
     event.stopImmediatePropagation();
 
-    const {id: playbackId, el} = hit;
+    const playbackId = hit.id;
+    const kind = hit.kind === 'movie' ? 'movie' : 'live';
+    const ext = hit.ext || (kind === 'live' ? 'ts' : 'mp4');
+    const el = hit.el;
     const title = (
+      hit.title ||
       el.dataset?.title ||
       el.querySelector?.('.media-title')?.textContent ||
       el.querySelector?.('h4')?.textContent ||
       el.querySelector?.('strong')?.textContent ||
-      'Vista Live'
+      (kind === 'movie' ? 'Vista Movie' : 'Vista Live')
     ).trim();
 
     try {
-      const r = await fetch(`/api/native/play-url/${encodeURIComponent(playbackId)}?kind=live&ext=ts`, {
+      const qs = new URLSearchParams({kind, ext});
+      const r = await originalFetch(`/api/native/play-url/${encodeURIComponent(playbackId)}?${qs}`, {
         cache: 'no-store',
-        credentials: 'include'
+        credentials: 'include',
       });
       if (!r.ok) throw new Error(`Vista playback ${r.status}`);
       const data = await r.json();
       if (!data?.url) throw new Error('Missing Vista playback URL');
-      await window.flutter_inappwebview.callHandler('vistaPlay', {url: data.url, title});
+      await window.flutter_inappwebview.callHandler('vistaPlay', {url: data.url, title, kind, ext});
     } catch (e) {
       console.error('Vista native playback failed', e);
       const badge = document.querySelector('#vistaConnection');
@@ -125,9 +152,13 @@ class _VistaShellState extends State<VistaShell> {
     if (value is! Map) return;
     final url = value['url']?.toString();
     if (url == null || !url.startsWith(vistaOrigin) || !mounted) return;
-    final title = value['title']?.toString() ?? 'Vista Live';
+    final title = value['title']?.toString() ?? 'Vista';
+    final kind = value['kind']?.toString() ?? 'live';
+    final ext = value['ext']?.toString() ?? '';
     await Navigator.of(context).push(
-      MaterialPageRoute(builder: (_) => VistaPlayer(url: url, title: title)),
+      MaterialPageRoute(
+        builder: (_) => VistaPlayer(url: url, title: title, kind: kind, ext: ext),
+      ),
     );
   }
 
@@ -228,8 +259,7 @@ class _VistaShellState extends State<VistaShell> {
                   if (uri == null || uri.host != 'vista-tv.vercel.app') {
                     return NavigationActionPolicy.CANCEL;
                   }
-                  // Allow Vista's real /login page and auth flow to load normally.
-                  // Only direct browser playback routes are blocked in the native app.
+                  // Browser playback is never allowed inside the native shell.
                   if (uri.path.startsWith('/api/play/')) {
                     return NavigationActionPolicy.CANCEL;
                   }
@@ -251,9 +281,20 @@ class _VistaShellState extends State<VistaShell> {
 }
 
 class VistaPlayer extends StatefulWidget {
-  const VistaPlayer({super.key, required this.url, required this.title});
+  const VistaPlayer({
+    super.key,
+    required this.url,
+    required this.title,
+    required this.kind,
+    required this.ext,
+  });
+
   final String url;
   final String title;
+  final String kind;
+  final String ext;
+
+  bool get isLive => kind == 'live';
 
   @override
   State<VistaPlayer> createState() => _VistaPlayerState();
@@ -262,6 +303,13 @@ class VistaPlayer extends StatefulWidget {
 class _VistaPlayerState extends State<VistaPlayer> {
   late final Player player;
   late final VideoController controller;
+  StreamSubscription<bool>? completedSub;
+  StreamSubscription<String>? errorSub;
+  Timer? reconnectTimer;
+  String? directUrl;
+  String? lastError;
+  int reconnectAttempts = 0;
+  bool disposed = false;
 
   @override
   void initState() {
@@ -275,11 +323,110 @@ class _VistaPlayerState extends State<VistaPlayer> {
         DeviceOrientation.landscapeRight,
       ]);
     }
-    player.open(Media(widget.url), play: true);
+
+    completedSub = player.stream.completed.listen((done) {
+      if (done && widget.isLive) scheduleReconnect();
+    });
+    errorSub = player.stream.error.listen((message) {
+      lastError = message;
+      if (mounted) setState(() {});
+      if (widget.isLive) scheduleReconnect();
+    });
+
+    startPlayback();
+  }
+
+  Future<String> resolveProviderUrl(String signedUrl) async {
+    final client = HttpClient();
+    client.userAgent = vistaIptvUserAgent;
+    try {
+      final request = await client.getUrl(Uri.parse(signedUrl));
+      request.followRedirects = false;
+      request.headers.set(HttpHeaders.acceptHeader, '*/*');
+      final response = await request.close().timeout(const Duration(seconds: 15));
+      final location = response.headers.value(HttpHeaders.locationHeader);
+      await response.drain();
+      if (location != null && response.statusCode >= 300 && response.statusCode < 400) {
+        return Uri.parse(signedUrl).resolve(location).toString();
+      }
+      return signedUrl;
+    } finally {
+      client.close(force: true);
+    }
+  }
+
+  Future<void> setNativeProperty(String name, String value) async {
+    final platform = player.platform;
+    if (platform is NativePlayer) {
+      try {
+        await platform.setProperty(name, value);
+      } catch (_) {
+        // Some bundled mpv builds do not expose every option; playback must
+        // continue even when an optional tuning property is unavailable.
+      }
+    }
+  }
+
+  Future<void> configureNativeTransport() async {
+    await setNativeProperty('user-agent', vistaIptvUserAgent);
+    await setNativeProperty('network-timeout', '90');
+    await setNativeProperty('cache', 'yes');
+    await setNativeProperty('demuxer-readahead-secs', widget.isLive ? '6' : '20');
+    if (widget.isLive) {
+      await setNativeProperty(
+        'stream-lavf-o',
+        'reconnect=1,reconnect_streamed=1,reconnect_on_network_error=1,reconnect_delay_max=5,multiple_requests=1',
+      );
+    }
+  }
+
+  Media mediaFor(String url) => Media(
+        url,
+        httpHeaders: const {
+          'User-Agent': vistaIptvUserAgent,
+          'Accept': '*/*',
+          'Connection': 'keep-alive',
+        },
+      );
+
+  Future<void> startPlayback() async {
+    try {
+      directUrl ??= await resolveProviderUrl(widget.url);
+      if (disposed) return;
+      await configureNativeTransport();
+      await player.open(mediaFor(directUrl!), play: true);
+      reconnectAttempts = 0;
+      lastError = null;
+      if (mounted) setState(() {});
+    } catch (e) {
+      lastError = e.toString();
+      if (mounted) setState(() {});
+      if (widget.isLive) scheduleReconnect();
+    }
+  }
+
+  void scheduleReconnect() {
+    if (disposed || !widget.isLive || reconnectTimer?.isActive == true) return;
+    final seconds = reconnectAttempts < 2 ? 1 : (reconnectAttempts < 5 ? 2 : 4);
+    reconnectAttempts += 1;
+    reconnectTimer = Timer(Duration(seconds: seconds), () async {
+      if (disposed || directUrl == null) return;
+      try {
+        await player.open(mediaFor(directUrl!), play: true);
+      } catch (e) {
+        lastError = e.toString();
+        if (mounted) setState(() {});
+        scheduleReconnect();
+      }
+    });
   }
 
   @override
   void dispose() {
+    disposed = true;
+    reconnectTimer?.cancel();
+    completedSub?.cancel();
+    errorSub?.cancel();
     if (!Platform.isWindows) {
       SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
       SystemChrome.setPreferredOrientations(DeviceOrientation.values);
@@ -319,13 +466,34 @@ class _VistaPlayerState extends State<VistaPlayer> {
                   widget.title,
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(
-                    fontSize: 13,
-                    fontWeight: FontWeight.w600,
-                  ),
+                  style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
                 ),
               ),
             ),
+            if (lastError != null)
+              Positioned(
+                left: 24,
+                right: 24,
+                bottom: 24,
+                child: SafeArea(
+                  child: DecoratedBox(
+                    decoration: BoxDecoration(
+                      color: const Color(0xCC111318),
+                      borderRadius: BorderRadius.circular(14),
+                    ),
+                    child: Padding(
+                      padding: const EdgeInsets.all(12),
+                      child: Text(
+                        widget.isLive
+                            ? 'Vista is reconnecting to this live channel…'
+                            : 'Vista could not open this movie: $lastError',
+                        textAlign: TextAlign.center,
+                        style: const TextStyle(fontSize: 12, color: Colors.white70),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
           ],
         ),
       );
